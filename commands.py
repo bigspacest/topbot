@@ -285,4 +285,188 @@ class ModCommands(commands.Cog):
         if not lock_data or not lock_data.get("locked"):
             return await safe_reply(ctx, f"{EMOJI['deny']} Este canal no está bloqueado.")
 
-        await self._restore_channel(channel, lock_data.get("original_overwrites", {}
+        await self._restore_channel(channel, lock_data.get("original_overwrites", {}))
+        await clear_lock(ctx.guild.id, channel.id)
+        await safe_reply(ctx, f"{EMOJI['accept']} Canal {channel.mention} desbloqueado.")
+
+    async def _restore_channel(self, channel: discord.TextChannel, original: dict):
+        everyone = channel.guild.default_role
+        overwrite = channel.overwrites_for(everyone)
+        overwrite.send_messages = original.get("send_messages")
+        overwrite.add_reactions = original.get("add_reactions")
+        overwrite.create_public_threads = original.get("create_public_threads")
+        overwrite.send_messages_in_threads = original.get("send_messages_in_threads")
+        await channel.set_permissions(everyone, overwrite=overwrite, reason="Unlock")
+
+    # ── BAN / UNBAN ───────────────────────────────────────────────────────────
+
+    @commands.command(name="ban")
+    async def ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Sin motivo"):
+        if not await require_mod(ctx):
+            return
+        if member.id == ctx.author.id:
+            return await safe_reply(ctx, f"{EMOJI['deny']} No puedes banearte a ti mismo.")
+        if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            return await safe_reply(ctx, f"{EMOJI['deny']} No puedes banear a alguien con rol igual o superior.")
+        if not ctx.guild.me.guild_permissions.ban_members:
+            return await safe_reply(ctx, f"{EMOJI['deny']} No tengo permiso `Ban Members`.")
+
+        try:
+            await member.ban(reason=f"{reason} | Por: {ctx.author}")
+            await safe_reply(ctx, f"{EMOJI['accept']} **{member}** baneado.\nMotivo: `{reason}`")
+        except discord.Forbidden:
+            await safe_reply(ctx, f"{EMOJI['deny']} No puedo banear a este usuario (jerarquía).")
+
+    @commands.command(name="unban")
+    async def unban(self, ctx: commands.Context, user_id: int, *, reason: str = "Sin motivo"):
+        if not await require_mod(ctx):
+            return
+        try:
+            user = await self.bot.fetch_user(user_id)
+            await ctx.guild.unban(user, reason=f"{reason} | Por: {ctx.author}")
+            await safe_reply(ctx, f"{EMOJI['accept']} **{user}** (`{user_id}`) desbaneado.\nMotivo: `{reason}`")
+        except discord.NotFound:
+            await safe_reply(ctx, f"{EMOJI['deny']} Usuario no encontrado o no está baneado.")
+        except discord.Forbidden:
+            await safe_reply(ctx, f"{EMOJI['deny']} No tengo permiso para desbanear.")
+
+    # ── KICK ──────────────────────────────────────────────────────────────────
+
+    @commands.command(name="kick")
+    async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Sin motivo"):
+        if not await require_mod(ctx):
+            return
+        if member.id == ctx.author.id:
+            return await safe_reply(ctx, f"{EMOJI['deny']} No puedes expulsarte a ti mismo.")
+        if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            return await safe_reply(ctx, f"{EMOJI['deny']} No puedes expulsar a alguien con rol igual o superior.")
+
+        try:
+            await member.kick(reason=f"{reason} | Por: {ctx.author}")
+            await safe_reply(ctx, f"{EMOJI['accept']} **{member}** expulsado.\nMotivo: `{reason}`")
+        except discord.Forbidden:
+            await safe_reply(ctx, f"{EMOJI['deny']} No puedo expulsar a este usuario (jerarquía).")
+
+    # ── MUTE / UNMUTE ─────────────────────────────────────────────────────────
+
+    @commands.command(name="mute")
+    async def mute(self, ctx: commands.Context, member: discord.Member, time_str: str, *, reason: str = "Sin motivo"):
+        if not await require_mod(ctx):
+            return
+        delta = parse_time(time_str)
+        if not delta:
+            return await safe_reply(
+                ctx,
+                f"{EMOJI['deny']} Formato de tiempo inválido.\n"
+                f"{EMOJI['search']} Formatos válidos: `10s` · `5m` · `1h` · `2d`"
+            )
+        if delta.total_seconds() > 2419200:
+            return await safe_reply(ctx, f"{EMOJI['deny']} El timeout máximo permitido por Discord es **28 días**.")
+
+        if member.id == ctx.author.id:
+            return await safe_reply(ctx, f"{EMOJI['deny']} No puedes silenciarte a ti mismo.")
+        if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            return await safe_reply(ctx, f"{EMOJI['deny']} No puedes silenciar a alguien con rol igual o superior.")
+
+        try:
+            await member.timeout(delta, reason=f"{reason} | Por: {ctx.author}")
+            await safe_reply(
+                ctx,
+                f"{EMOJI['accept']} **{member}** silenciado por `{time_str}` {EMOJI['clock']}\nMotivo: `{reason}`"
+            )
+        except discord.Forbidden:
+            await safe_reply(ctx, f"{EMOJI['deny']} No puedo silenciar a este usuario (jerarquía o permisos).")
+
+    @commands.command(name="unmute")
+    async def unmute(self, ctx: commands.Context, member: discord.Member):
+        if not await require_mod(ctx):
+            return
+        try:
+            await member.timeout(None, reason=f"Unmute por {ctx.author}")
+            await safe_reply(ctx, f"{EMOJI['accept']} **{member}** ya no está silenciado.")
+        except discord.Forbidden:
+            await safe_reply(ctx, f"{EMOJI['deny']} No puedo quitar el silencio a este usuario.")
+
+    # ── WARN SYSTEM ───────────────────────────────────────────────────────────
+
+    @commands.command(name="warn")
+    async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Sin motivo"):
+        if not await require_mod(ctx):
+            return
+        warn_id = await add_warn(ctx.guild.id, member.id, ctx.author.id, reason)
+        total = len(await get_warns(ctx.guild.id, member.id))
+
+        embed = discord.Embed(
+            description=(
+                f"{EMOJI['warn']} **{member}** ha recibido un warn.\n"
+                f"**ID:** `{warn_id}` · **Total:** `{total}`\n"
+                f"**Motivo:** {reason}"
+            ),
+            color=0xF1C40F
+        )
+        await safe_reply(ctx, "", embed)
+
+        try:
+            await member.send(
+                f"{EMOJI['warn']} Has recibido un warn en **{ctx.guild.name}**.\n"
+                f"Motivo: `{reason}` · ID: `{warn_id}`"
+            )
+        except discord.Forbidden:
+            pass
+
+    @commands.command(name="warnings")
+    async def warnings(self, ctx: commands.Context, member: discord.Member):
+        if not await require_mod(ctx):
+            return
+        warns_list = await get_warns(ctx.guild.id, member.id)
+        if not warns_list:
+            return await safe_reply(ctx, f"{EMOJI['search']} **{member}** no tiene warns.")
+
+        embed = discord.Embed(
+            title=f"{EMOJI['search']} Warns de {member}",
+            color=0xF1C40F
+        )
+        for w in sorted(warns_list, key=lambda x: x["id"]):
+            ts = w["timestamp"].strftime("%d/%m/%Y %H:%M") if isinstance(w["timestamp"], datetime) else "—"
+            embed.add_field(
+                name=f"ID `{w['id']}` — {ts}",
+                value=f"Motivo: {w['reason']}\nMod: <@{w['moderator_id']}>",
+                inline=False
+            )
+        await safe_reply(ctx, "", embed)
+
+    @commands.command(name="delwarn")
+    async def delwarn(self, ctx: commands.Context, member: discord.Member, warn_id: int):
+        if not await require_mod(ctx):
+            return
+        deleted = await delete_warn(ctx.guild.id, member.id, warn_id)
+        if deleted:
+            await safe_reply(ctx, f"{EMOJI['accept']} Warn `{warn_id}` de **{member}** eliminado.")
+        else:
+            await safe_reply(ctx, f"{EMOJI['deny']} No se encontró el warn `{warn_id}` para **{member}**.")
+
+    # ── NOTES ─────────────────────────────────────────────────────────────────
+
+    @commands.command(name="addnote")
+    async def addnote(self, ctx: commands.Context, member: discord.Member, *, content: str):
+        if not await require_mod(ctx):
+            return
+        note_id = await add_note(ctx.guild.id, member.id, ctx.author.id, content)
+        await safe_reply(
+            ctx,
+            f"{EMOJI['pen']} Nota añadida a **{member}**.\n**ID:** `{note_id}`\n**Contenido:** {content}"
+        )
+
+    @commands.command(name="removenote")
+    async def removenote(self, ctx: commands.Context, member: discord.Member, note_id: int):
+        if not await require_mod(ctx):
+            return
+        deleted = await delete_note(ctx.guild.id, member.id, note_id)
+        if deleted:
+            await safe_reply(ctx, f"{EMOJI['accept']} Nota `{note_id}` de **{member}** eliminada.")
+        else:
+            await safe_reply(ctx, f"{EMOJI['deny']} No se encontró la nota `{note_id}` para **{member}**.")
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(ModCommands(bot))
