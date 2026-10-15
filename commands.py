@@ -4,13 +4,15 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
-from config import EMOJI, CREATOR_ID
+from config import EMOJI
 from database import (
     add_warn, get_warns, delete_warn,
-    add_note, get_notes, delete_note,
-    set_lock, get_lock, clear_lock
+    add_note, delete_note,
+    set_lock, get_lock, clear_lock,
+    get_guild_config, set_admin_roles, set_mod_roles
 )
 
 
@@ -27,82 +29,216 @@ def parse_time(time_str: str) -> Optional[timedelta]:
     return timedelta(**{mapping[unit]: value})
 
 
-# ─── HELPERS ─────────────────────────────────────────────────────────────────
+# ─── PERMISSION HELPERS ──────────────────────────────────────────────────────
 
-def has_mod_perms(ctx: commands.Context) -> bool:
-    perms = ctx.author.guild_permissions
-    return perms.administrator or perms.manage_guild or perms.ban_members or perms.moderate_members
+async def is_admin(member: discord.Member) -> bool:
+    if member.guild.owner_id == member.id or member.guild_permissions.administrator:
+        return True
+    cfg = await get_guild_config(member.guild.id)
+    admin_roles = set(cfg.get("admin_roles", []))
+    return any(r.id in admin_roles for r in member.roles)
+
+
+async def is_mod(member: discord.Member) -> bool:
+    if await is_admin(member):
+        return True
+    cfg = await get_guild_config(member.guild.id)
+    mod_roles = set(cfg.get("mod_roles", []))
+    return any(r.id in mod_roles for r in member.roles)
+
+
+async def require_mod(ctx: commands.Context) -> bool:
+    if await is_mod(ctx.author):
+        return True
+    await safe_reply(ctx, f"{EMOJI['deny']} No tienes el rol de moderador/administrador configurado.")
+    return False
 
 
 async def safe_reply(ctx: commands.Context, content: str, embed: discord.Embed = None):
     try:
         if embed:
-            await ctx.reply(content, embed=embed, mention_author=False)
+            await ctx.reply(content if content else None, embed=embed, mention_author=False)
         else:
             await ctx.reply(content, mention_author=False)
     except discord.HTTPException:
         pass
 
 
-# ─── COMMANDS ────────────────────────────────────────────────────────────────
+# ─── SETUP VIEW ──────────────────────────────────────────────────────────────
+
+class SetupView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="Selecciona rol(es) de Administrador",
+        min_values=0,
+        max_values=10,
+        custom_id="setup_admin_roles"
+    )
+    async def admin_select(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        if not await is_admin(interaction.user):
+            return await interaction.response.send_message(
+                f"{EMOJI['deny']} Solo administradores pueden modificar esto.", ephemeral=True
+            )
+        role_ids = [r.id for r in select.values]
+        await set_admin_roles(self.guild_id, role_ids)
+        roles_txt = ", ".join(r.mention for r in select.values) if select.values else "*Ninguno*"
+        await interaction.response.send_message(
+            f"{EMOJI['accept']} Roles de **Administrador** actualizados:\n{roles_txt}",
+            ephemeral=True
+        )
+
+    @discord.ui.select(
+        cls=discord.ui.RoleSelect,
+        placeholder="Selecciona rol(es) de Moderador",
+        min_values=0,
+        max_values=10,
+        custom_id="setup_mod_roles"
+    )
+    async def mod_select(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
+        if not await is_admin(interaction.user):
+            return await interaction.response.send_message(
+                f"{EMOJI['deny']} Solo administradores pueden modificar esto.", ephemeral=True
+            )
+        role_ids = [r.id for r in select.values]
+        await set_mod_roles(self.guild_id, role_ids)
+        roles_txt = ", ".join(r.mention for r in select.values) if select.values else "*Ninguno*"
+        await interaction.response.send_message(
+            f"{EMOJI['accept']} Roles de **Moderador** actualizados:\n{roles_txt}",
+            ephemeral=True
+        )
+
+
+# ─── COG ─────────────────────────────────────────────────────────────────────
 
 class ModCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ── CMDS ──────────────────────────────────────────────────────────────────
+    # ── /setup ────────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="setup", description="Panel de configuración de roles de staff")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def setup(self, interaction: discord.Interaction):
+        cfg = await get_guild_config(interaction.guild.id)
+        admin_mentions = [f"<@&{rid}>" for rid in cfg.get("admin_roles", [])]
+        mod_mentions = [f"<@&{rid}>" for rid in cfg.get("mod_roles", [])]
+
+        embed = discord.Embed(
+            title=f"{EMOJI['pen']} Panel de Configuración — TopBot",
+            description=(
+                "Configura los roles que tendrán acceso a los comandos de moderación.\n\n"
+                f"**Admin roles actuales:** {', '.join(admin_mentions) if admin_mentions else '*Sin configurar*'}\n"
+                f"**Mod roles actuales:** {', '.join(mod_mentions) if mod_mentions else '*Sin configurar*'}\n\n"
+                "Usa los selectores de abajo para asignar uno o varios roles."
+            ),
+            color=0x5865F2
+        )
+        embed.set_footer(text="Los cambios se aplican al instante • Solo administradores")
+        view = SetupView(interaction.guild.id)
+        await interaction.response.send_message(embed=embed, view=view)
+
+    @setup.error
+    async def setup_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message(
+                f"{EMOJI['deny']} Necesitas permiso de Administrador de Discord.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"{EMOJI['deny']} Error: {error}", ephemeral=True
+            )
+
+    # ── ?cmds ─────────────────────────────────────────────────────────────────
 
     @commands.command(name="cmds")
     async def cmds(self, ctx: commands.Context):
+        if not await is_mod(ctx.author):
+            return await safe_reply(
+                ctx,
+                f"{EMOJI['deny']} Este comando solo está disponible para staff configurado."
+            )
+
         embed = discord.Embed(
-            title=f"{EMOJI['search']} Lista de Comandos — TopBot",
+            title=f"{EMOJI['search']}  Comandos de Moderación",
+            description="Lista de comandos disponibles para el staff.",
             color=0x2B2D31
         )
+
         embed.add_field(
-            name="Moderación",
+            name=f"{EMOJI['clock']}  Canales",
             value=(
-                "`?lock <canal> <tiempo>` — Bloquea un canal temporalmente\n"
-                "`?unlock` — Desbloquea el canal actual\n"
-                "`?ban <usuario> <motivo>` — Banea a un usuario\n"
-                "`?unban <user-id> <motivo>` — Desbanea por ID\n"
-                "`?kick <usuario> <motivo>` — Expulsa a un usuario\n"
-                "`?mute <usuario> <tiempo>` — Silencia (timeout)\n"
-                "`?unmute <usuario>` — Quita el silencio"
+                "```\n"
+                "?lock [canal] [tiempo]   Bloquear canal\n"
+                "?unlock [canal]          Desbloquear canal\n"
+                "```"
             ),
             inline=False
         )
         embed.add_field(
-            name="Warns & Notes",
+            name=f"{EMOJI['deny']}  Sanciones",
             value=(
-                "`?warn <usuario> <motivo>` — Añade un warn\n"
-                "`?warnings <usuario>` — Lista warns de un usuario\n"
-                "`?delwarn <usuario> <warn-id>` — Elimina un warn\n"
-                "`?addnote <usuario> <nota>` — Añade una nota\n"
-                "`?removenote <usuario> <note-id>` — Elimina una nota"
+                "```\n"
+                "?ban <usuario> [motivo]      Banear\n"
+                "?unban <user-id> [motivo]    Desbanear\n"
+                "?kick <usuario> [motivo]     Expulsar\n"
+                "?mute <usuario> <tiempo>     Timeout\n"
+                "?unmute <usuario>            Quitar timeout\n"
+                "```"
             ),
             inline=False
         )
-        embed.set_footer(text="Prefijo: ? | Solo staff con permisos")
+        embed.add_field(
+            name=f"{EMOJI['warn']}  Warns",
+            value=(
+                "```\n"
+                "?warn <usuario> [motivo]     Añadir warn\n"
+                "?warnings <usuario>          Ver warns\n"
+                "?delwarn <usuario> <id>      Eliminar warn\n"
+                "```"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name=f"{EMOJI['pen']}  Notas",
+            value=(
+                "```\n"
+                "?addnote <usuario> <nota>    Añadir nota\n"
+                "?removenote <usuario> <id>   Eliminar nota\n"
+                "```"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name=f"{EMOJI['search']}  Utilidad",
+            value="```\n?cmds    Ver esta lista\n/setup   Configurar roles de staff\n```",
+            inline=False
+        )
+        embed.set_footer(text="Tiempo: 10s · 5m · 1h · 2d  |  Prefijo: ?")
         await safe_reply(ctx, "", embed)
 
     # ── LOCK / UNLOCK ─────────────────────────────────────────────────────────
 
     @commands.command(name="lock")
-    @commands.has_permissions(manage_channels=True)
     async def lock(self, ctx: commands.Context, channel: discord.TextChannel = None, time_str: str = None):
+        if not await require_mod(ctx):
+            return
         channel = channel or ctx.channel
 
         if not ctx.guild.me.guild_permissions.manage_channels:
             return await safe_reply(ctx, f"{EMOJI['deny']} No tengo permiso `Manage Channels`.")
 
         unlock_at = None
+        delta = None
         if time_str:
             delta = parse_time(time_str)
             if not delta:
                 return await safe_reply(ctx, f"{EMOJI['deny']} Formato de tiempo inválido. Usa: `10m`, `1h`, `2d`.")
             unlock_at = datetime.utcnow() + delta
 
-        # Guardar overwrites actuales de @everyone
         everyone = ctx.guild.default_role
         current = channel.overwrites_for(everyone)
         original = {
@@ -112,7 +248,6 @@ class ModCommands(commands.Cog):
             "send_messages_in_threads": current.send_messages_in_threads,
         }
 
-        # Aplicar lock
         overwrite = channel.overwrites_for(everyone)
         overwrite.send_messages = False
         overwrite.add_reactions = False
@@ -123,9 +258,9 @@ class ModCommands(commands.Cog):
         await set_lock(ctx.guild.id, channel.id, unlock_at, original)
 
         msg = f"{EMOJI['accept']} Canal {channel.mention} bloqueado."
-        if unlock_at:
+        if unlock_at and delta:
             msg += f" Se desbloqueará en `{time_str}` {EMOJI['hourglass']}"
-            # Schedule unlock
+
             async def auto_unlock():
                 await asyncio.sleep(delta.total_seconds())
                 lock_data = await get_lock(ctx.guild.id, channel.id)
@@ -137,8 +272,9 @@ class ModCommands(commands.Cog):
         await safe_reply(ctx, msg)
 
     @commands.command(name="unlock")
-    @commands.has_permissions(manage_channels=True)
     async def unlock(self, ctx: commands.Context, channel: discord.TextChannel = None):
+        if not await require_mod(ctx):
+            return
         channel = channel or ctx.channel
         lock_data = await get_lock(ctx.guild.id, channel.id)
 
@@ -161,8 +297,9 @@ class ModCommands(commands.Cog):
     # ── BAN / UNBAN ───────────────────────────────────────────────────────────
 
     @commands.command(name="ban")
-    @commands.has_permissions(ban_members=True)
     async def ban(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Sin motivo"):
+        if not await require_mod(ctx):
+            return
         if member.id == ctx.author.id:
             return await safe_reply(ctx, f"{EMOJI['deny']} No puedes banearte a ti mismo.")
         if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
@@ -177,8 +314,9 @@ class ModCommands(commands.Cog):
             await safe_reply(ctx, f"{EMOJI['deny']} No puedo banear a este usuario (jerarquía).")
 
     @commands.command(name="unban")
-    @commands.has_permissions(ban_members=True)
     async def unban(self, ctx: commands.Context, user_id: int, *, reason: str = "Sin motivo"):
+        if not await require_mod(ctx):
+            return
         try:
             user = await self.bot.fetch_user(user_id)
             await ctx.guild.unban(user, reason=f"{reason} | Por: {ctx.author}")
@@ -191,8 +329,9 @@ class ModCommands(commands.Cog):
     # ── KICK ──────────────────────────────────────────────────────────────────
 
     @commands.command(name="kick")
-    @commands.has_permissions(kick_members=True)
     async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Sin motivo"):
+        if not await require_mod(ctx):
+            return
         if member.id == ctx.author.id:
             return await safe_reply(ctx, f"{EMOJI['deny']} No puedes expulsarte a ti mismo.")
         if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
@@ -207,12 +346,13 @@ class ModCommands(commands.Cog):
     # ── MUTE / UNMUTE ─────────────────────────────────────────────────────────
 
     @commands.command(name="mute")
-    @commands.has_permissions(moderate_members=True)
     async def mute(self, ctx: commands.Context, member: discord.Member, time_str: str, *, reason: str = "Sin motivo"):
+        if not await require_mod(ctx):
+            return
         delta = parse_time(time_str)
         if not delta:
             return await safe_reply(ctx, f"{EMOJI['deny']} Formato de tiempo inválido. Usa: `10m`, `1h`, `2d`.")
-        if delta.total_seconds() > 2419200:  # 28 días max Discord
+        if delta.total_seconds() > 2419200:
             return await safe_reply(ctx, f"{EMOJI['deny']} El máximo de timeout es 28 días.")
 
         if member.id == ctx.author.id:
@@ -230,8 +370,9 @@ class ModCommands(commands.Cog):
             await safe_reply(ctx, f"{EMOJI['deny']} No puedo silenciar a este usuario (jerarquía o permisos).")
 
     @commands.command(name="unmute")
-    @commands.has_permissions(moderate_members=True)
     async def unmute(self, ctx: commands.Context, member: discord.Member):
+        if not await require_mod(ctx):
+            return
         try:
             await member.timeout(None, reason=f"Unmute por {ctx.author}")
             await safe_reply(ctx, f"{EMOJI['accept']} **{member}** ya no está silenciado.")
@@ -241,15 +382,18 @@ class ModCommands(commands.Cog):
     # ── WARN SYSTEM ───────────────────────────────────────────────────────────
 
     @commands.command(name="warn")
-    @commands.has_permissions(moderate_members=True)
     async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str = "Sin motivo"):
+        if not await require_mod(ctx):
+            return
         warn_id = await add_warn(ctx.guild.id, member.id, ctx.author.id, reason)
         total = len(await get_warns(ctx.guild.id, member.id))
 
         embed = discord.Embed(
-            description=f"{EMOJI['warn']} **{member}** ha recibido un warn.\n"
-                        f"**ID:** `{warn_id}` | **Total:** `{total}`\n"
-                        f"**Motivo:** {reason}",
+            description=(
+                f"{EMOJI['warn']} **{member}** ha recibido un warn.\n"
+                f"**ID:** `{warn_id}` · **Total:** `{total}`\n"
+                f"**Motivo:** {reason}"
+            ),
             color=0xF1C40F
         )
         await safe_reply(ctx, "", embed)
@@ -257,14 +401,15 @@ class ModCommands(commands.Cog):
         try:
             await member.send(
                 f"{EMOJI['warn']} Has recibido un warn en **{ctx.guild.name}**.\n"
-                f"Motivo: `{reason}` | ID: `{warn_id}`"
+                f"Motivo: `{reason}` · ID: `{warn_id}`"
             )
         except discord.Forbidden:
             pass
 
     @commands.command(name="warnings")
-    @commands.has_permissions(moderate_members=True)
     async def warnings(self, ctx: commands.Context, member: discord.Member):
+        if not await require_mod(ctx):
+            return
         warns_list = await get_warns(ctx.guild.id, member.id)
         if not warns_list:
             return await safe_reply(ctx, f"{EMOJI['search']} **{member}** no tiene warns.")
@@ -283,8 +428,9 @@ class ModCommands(commands.Cog):
         await safe_reply(ctx, "", embed)
 
     @commands.command(name="delwarn")
-    @commands.has_permissions(moderate_members=True)
     async def delwarn(self, ctx: commands.Context, member: discord.Member, warn_id: int):
+        if not await require_mod(ctx):
+            return
         deleted = await delete_warn(ctx.guild.id, member.id, warn_id)
         if deleted:
             await safe_reply(ctx, f"{EMOJI['accept']} Warn `{warn_id}` de **{member}** eliminado.")
@@ -294,8 +440,9 @@ class ModCommands(commands.Cog):
     # ── NOTES ─────────────────────────────────────────────────────────────────
 
     @commands.command(name="addnote")
-    @commands.has_permissions(moderate_members=True)
     async def addnote(self, ctx: commands.Context, member: discord.Member, *, content: str):
+        if not await require_mod(ctx):
+            return
         note_id = await add_note(ctx.guild.id, member.id, ctx.author.id, content)
         await safe_reply(
             ctx,
@@ -303,8 +450,9 @@ class ModCommands(commands.Cog):
         )
 
     @commands.command(name="removenote")
-    @commands.has_permissions(moderate_members=True)
     async def removenote(self, ctx: commands.Context, member: discord.Member, note_id: int):
+        if not await require_mod(ctx):
+            return
         deleted = await delete_note(ctx.guild.id, member.id, note_id)
         if deleted:
             await safe_reply(ctx, f"{EMOJI['accept']} Nota `{note_id}` de **{member}** eliminada.")
