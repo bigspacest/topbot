@@ -38,7 +38,7 @@ async def on_ready():
     print(f"[TOPBOT] Online as {bot.user} | ID: {bot.user.id}")
     print(f"[TOPBOT] Guilds: {len(bot.guilds)}")
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.watching, name="?cmds | /setup")
+        activity=discord.Activity(type=discord.ActivityType.watching, name="dev: Imchahinne")
     )
 
 
