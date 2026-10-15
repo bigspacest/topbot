@@ -7,13 +7,40 @@ db = client[DB_NAME]
 
 warns = db.warns
 notes = db.notes
-locks = db.locks  # channel lock state
+locks = db.locks
+guild_config = db.guild_config
 
 
 async def ensure_indexes():
     await warns.create_index([("guild_id", 1), ("user_id", 1)])
     await notes.create_index([("guild_id", 1), ("user_id", 1)])
     await locks.create_index([("guild_id", 1), ("channel_id", 1)], unique=True)
+    await guild_config.create_index([("guild_id", 1)], unique=True)
+
+
+# ─── GUILD CONFIG ────────────────────────────────────────────────────────────
+
+async def get_guild_config(guild_id: int) -> dict:
+    doc = await guild_config.find_one({"guild_id": guild_id})
+    if not doc:
+        return {"guild_id": guild_id, "admin_roles": [], "mod_roles": []}
+    return doc
+
+
+async def set_admin_roles(guild_id: int, role_ids: list[int]):
+    await guild_config.update_one(
+        {"guild_id": guild_id},
+        {"$set": {"admin_roles": role_ids}},
+        upsert=True
+    )
+
+
+async def set_mod_roles(guild_id: int, role_ids: list[int]):
+    await guild_config.update_one(
+        {"guild_id": guild_id},
+        {"$set": {"mod_roles": role_ids}},
+        upsert=True
+    )
 
 
 # ─── WARNS ───────────────────────────────────────────────────────────────────
