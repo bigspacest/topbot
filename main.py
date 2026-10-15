@@ -9,6 +9,7 @@ from config import TOKEN, PREFIX, CREATOR_ID, EMOJI, INVITE_REGEX, AUTO_MUTE_SEC
 from database import ensure_indexes
 from keep_alive import keep_alive
 import commands as cmds_module  # noqa: F401
+from commands import is_mod, NO_PERMS_MSG
 
 
 intents = discord.Intents.default()
@@ -29,10 +30,15 @@ INVITE_PATTERN = re.compile(INVITE_REGEX, re.IGNORECASE)
 @bot.event
 async def on_ready():
     await ensure_indexes()
+    try:
+        synced = await bot.tree.sync()
+        print(f"[TOPBOT] Slash commands synced: {len(synced)}")
+    except Exception as e:
+        print(f"[TOPBOT] Slash sync error: {e}")
     print(f"[TOPBOT] Online as {bot.user} | ID: {bot.user.id}")
     print(f"[TOPBOT] Guilds: {len(bot.guilds)}")
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.watching, name="?cmds")
+        activity=discord.Activity(type=discord.ActivityType.watching, name="?cmds | /setup")
     )
 
 
@@ -43,7 +49,6 @@ async def on_message(message: discord.Message):
 
     # ── PING RESPONSE (solo creador) ──────────────────────────────────────────
     if bot.user in message.mentions and message.author.id == CREATOR_ID:
-        # Solo responder si el mensaje es esencialmente solo el mention
         content_clean = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
         if not content_clean:
             await message.reply("hello, como estas?", mention_author=False)
@@ -51,7 +56,6 @@ async def on_message(message: discord.Message):
 
     # ── AUTO-MOD: Discord invites ─────────────────────────────────────────────
     if INVITE_PATTERN.search(message.content):
-        # Ignorar si el autor tiene permisos de moderación
         perms = message.author.guild_permissions
         if not (perms.administrator or perms.manage_messages or perms.manage_guild):
             try:
@@ -59,7 +63,6 @@ async def on_message(message: discord.Message):
             except discord.Forbidden:
                 pass
 
-            # Mute 2 minutos
             try:
                 await message.author.timeout(
                     timedelta(seconds=AUTO_MUTE_SECONDS),
@@ -80,16 +83,44 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    # Si no es staff → siempre denegar por permisos (incluso en args incompletos)
+    if isinstance(error, (
+        commands.MissingRequiredArgument,
+        commands.BadArgument,
+        commands.MissingPermissions,
+        commands.CheckFailure,
+    )):
+        if not await is_mod(ctx.author):
+            return await ctx.reply(NO_PERMS_MSG, mention_author=False)
+
     if isinstance(error, commands.MissingPermissions):
-        await ctx.reply(f"{EMOJI['deny']} No tienes permisos suficientes.", mention_author=False)
+        await ctx.reply(NO_PERMS_MSG, mention_author=False)
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.reply(f"{EMOJI['deny']} Faltan argumentos. Usa `?cmds` para ver la sintaxis.", mention_author=False)
+        param = error.param.name if error.param else "requerido"
+        await ctx.reply(
+            f"{EMOJI['deny']} Falta el argumento `{param}`.\n"
+            f"{EMOJI['search']} Usa `?cmds` para ver la sintaxis correcta.",
+            mention_author=False
+        )
     elif isinstance(error, commands.BadArgument):
-        await ctx.reply(f"{EMOJI['deny']} Argumento inválido. Verifica el usuario/canal/ID.", mention_author=False)
+        await ctx.reply(
+            f"{EMOJI['deny']} Argumento inválido.\n"
+            f"{EMOJI['search']} Verifica el usuario, canal o ID e inténtalo de nuevo.",
+            mention_author=False
+        )
     elif isinstance(error, commands.CommandNotFound):
-        pass  # silencioso
+        pass
     elif isinstance(error, commands.BotMissingPermissions):
-        await ctx.reply(f"{EMOJI['deny']} Me faltan permisos para ejecutar este comando.", mention_author=False)
+        missing = ", ".join(error.missing_permissions) if hasattr(error, "missing_permissions") else "desconocido"
+        await ctx.reply(
+            f"{EMOJI['deny']} Me faltan permisos para ejecutar este comando (`{missing}`).",
+            mention_author=False
+        )
+    elif isinstance(error, commands.CommandOnCooldown):
+        await ctx.reply(
+            f"{EMOJI['hourglass']} Espera `{error.retry_after:.1f}s` antes de usar este comando de nuevo.",
+            mention_author=False
+        )
     else:
         print(f"[ERROR] {type(error).__name__}: {error}")
 
